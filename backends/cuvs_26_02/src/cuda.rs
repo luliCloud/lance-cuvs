@@ -17,13 +17,23 @@ use std::ptr;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 pub(crate) type CudaEventHandle = *mut c_void;
+// cuvs-sys 26.8 no longer re-exports CUDA runtime types, so declare what is used here.
+pub(crate) type CudaStatus = i32;
+const CUDA_MEMCPY_DEFAULT: i32 = 4;
 
 #[link(name = "cudart")]
 unsafe extern "C" {
-    fn cudaMallocHost(ptr: *mut *mut c_void, size: usize) -> cuvs_sys::cudaError_t;
-    fn cudaFreeHost(ptr: *mut c_void) -> cuvs_sys::cudaError_t;
-    fn cudaHostRegister(ptr: *mut c_void, size: usize, flags: u32) -> cuvs_sys::cudaError_t;
-    fn cudaHostUnregister(ptr: *mut c_void) -> cuvs_sys::cudaError_t;
+    fn cudaMemcpyAsync(
+        dst: *mut c_void,
+        src: *const c_void,
+        count: usize,
+        kind: i32,
+        stream: cuvs_sys::cudaStream_t,
+    ) -> CudaStatus;
+    fn cudaMallocHost(ptr: *mut *mut c_void, size: usize) -> CudaStatus;
+    fn cudaFreeHost(ptr: *mut c_void) -> CudaStatus;
+    fn cudaHostRegister(ptr: *mut c_void, size: usize, flags: u32) -> CudaStatus;
+    fn cudaHostUnregister(ptr: *mut c_void) -> CudaStatus;
     fn cudaMemcpy2DAsync(
         dst: *mut c_void,
         dpitch: usize,
@@ -31,31 +41,31 @@ unsafe extern "C" {
         spitch: usize,
         width: usize,
         height: usize,
-        kind: cuvs_sys::cudaMemcpyKind,
+        kind: i32,
         stream: cuvs_sys::cudaStream_t,
-    ) -> cuvs_sys::cudaError_t;
-    fn cudaEventCreate(event: *mut CudaEventHandle) -> cuvs_sys::cudaError_t;
-    fn cudaEventDestroy(event: CudaEventHandle) -> cuvs_sys::cudaError_t;
+    ) -> CudaStatus;
+    fn cudaEventCreate(event: *mut CudaEventHandle) -> CudaStatus;
+    fn cudaEventDestroy(event: CudaEventHandle) -> CudaStatus;
     fn cudaEventRecord(
         event: CudaEventHandle,
         stream: cuvs_sys::cudaStream_t,
-    ) -> cuvs_sys::cudaError_t;
-    fn cudaEventSynchronize(event: CudaEventHandle) -> cuvs_sys::cudaError_t;
+    ) -> CudaStatus;
+    fn cudaEventSynchronize(event: CudaEventHandle) -> CudaStatus;
     fn cudaEventElapsedTime(
         ms: *mut f32,
         start: CudaEventHandle,
         end: CudaEventHandle,
-    ) -> cuvs_sys::cudaError_t;
+    ) -> CudaStatus;
     fn cudaStreamCreateWithFlags(
         stream: *mut cuvs_sys::cudaStream_t,
         flags: u32,
-    ) -> cuvs_sys::cudaError_t;
-    fn cudaStreamDestroy(stream: cuvs_sys::cudaStream_t) -> cuvs_sys::cudaError_t;
+    ) -> CudaStatus;
+    fn cudaStreamDestroy(stream: cuvs_sys::cudaStream_t) -> CudaStatus;
     fn cudaStreamWaitEvent(
         stream: cuvs_sys::cudaStream_t,
         event: CudaEventHandle,
         flags: u32,
-    ) -> cuvs_sys::cudaError_t;
+    ) -> CudaStatus;
 }
 
 /// `cudaStreamNonBlocking`: no implicit synchronization with the legacy
@@ -190,7 +200,7 @@ impl<T: DlElement> DeviceTensor<T> {
         let capacity_bytes = shape.iter().product::<usize>() * std::mem::size_of::<T>();
         let mut data = ptr::null_mut();
         check_cuvs(
-            unsafe { cuvs_sys::cuvsRMMAlloc(resources.0, &mut data, capacity_bytes) },
+            unsafe { cuvs_sys::cuvsRMMAlloc(resources.handle(), &mut data, capacity_bytes) },
             "allocate device tensor",
         )?;
         let shape = shape.iter().map(|dim| *dim as i64).collect::<Vec<_>>();
@@ -214,7 +224,7 @@ impl<T: DlElement> DeviceTensor<T> {
             shape,
             tensor,
             capacity_bytes,
-            resources: resources.0,
+            resources: resources.handle(),
             _marker: PhantomData,
         })
     }
@@ -271,11 +281,11 @@ impl<T: DlElement> DeviceTensor<T> {
         }
         check_cuda(
             unsafe {
-                cuvs_sys::cudaMemcpyAsync(
+                cudaMemcpyAsync(
                     self.tensor.dl_tensor.data,
                     src.as_ptr() as *const _,
                     self.current_bytes(),
-                    cuvs_sys::cudaMemcpyKind_cudaMemcpyDefault,
+                    CUDA_MEMCPY_DEFAULT,
                     stream,
                 )
             },
@@ -324,11 +334,11 @@ impl<T: DlElement> DeviceTensor<T> {
         for segment in segments {
             check_cuda(
                 unsafe {
-                    cuvs_sys::cudaMemcpyAsync(
+                    cudaMemcpyAsync(
                         dst.add(segment.start).cast(),
                         src_bytes.add(segment.start).cast(),
                         segment.end - segment.start,
-                        cuvs_sys::cudaMemcpyKind_cudaMemcpyDefault,
+                        CUDA_MEMCPY_DEFAULT,
                         stream,
                     )
                 },
@@ -348,13 +358,13 @@ impl<T: DlElement> DeviceTensor<T> {
         }
         check_cuda(
             unsafe {
-                cuvs_sys::cudaMemcpyAsync(
+                cudaMemcpyAsync(
                     dst.as_mut_ptr() as *mut _,
                     self.tensor.dl_tensor.data,
                     self.current_bytes(),
-                    cuvs_sys::cudaMemcpyKind_cudaMemcpyDefault,
+                    CUDA_MEMCPY_DEFAULT,
                     resources
-                        .get_cuda_stream()
+                        .stream()
                         .map_err(|e| Error::io(e.to_string()))?,
                 )
             },
@@ -545,7 +555,7 @@ impl RegistrationCache {
         for (gap_start, gap_end) in gaps {
             let status =
                 unsafe { cudaHostRegister(gap_start as *mut c_void, gap_end - gap_start, 0) };
-            if status == cuvs_sys::cudaError::cudaSuccess {
+            if status == 0 {
                 ranges.insert(gap_start, gap_end);
                 registered.push((gap_start, gap_end));
                 cover.new_registrations += 1;
@@ -819,8 +829,8 @@ pub(crate) fn check_cuvs(status: cuvs_sys::cuvsError_t, context: &str) -> Result
     Err(Error::io(format!("cuVS failed to {context}: {message}")))
 }
 
-pub(crate) fn check_cuda(status: cuvs_sys::cudaError_t, context: &str) -> Result<()> {
-    if status == cuvs_sys::cudaError::cudaSuccess {
+pub(crate) fn check_cuda(status: CudaStatus, context: &str) -> Result<()> {
+    if status == 0 {
         Ok(())
     } else {
         Err(Error::io(format!("CUDA failed to {context}: {status:?}")))
@@ -955,16 +965,16 @@ pub(crate) fn copy_tensor_to_host_f32_2d(
     }
     let mut array = Array2::<f32>::zeros((shape[0], shape[1]));
     let stream = resources
-        .get_cuda_stream()
+        .stream()
         .map_err(|e| Error::io(e.to_string()))?;
     if tensor.dl_tensor.strides.is_null() {
         check_cuda(
             unsafe {
-                cuvs_sys::cudaMemcpyAsync(
+                cudaMemcpyAsync(
                     array.as_mut_ptr() as *mut _,
                     tensor.dl_tensor.data,
                     tensor_num_bytes(tensor),
-                    cuvs_sys::cudaMemcpyKind_cudaMemcpyDefault,
+                    CUDA_MEMCPY_DEFAULT,
                     stream,
                 )
             },
@@ -989,7 +999,7 @@ pub(crate) fn copy_tensor_to_host_f32_2d(
                     row_stride * std::mem::size_of::<f32>(),
                     row_bytes,
                     shape[0],
-                    cuvs_sys::cudaMemcpyKind_cudaMemcpyDefault,
+                    CUDA_MEMCPY_DEFAULT,
                     stream,
                 )
             },
@@ -1015,13 +1025,13 @@ pub(crate) fn copy_tensor_to_host_f32_3d(
     let mut values = vec![0.0f32; shape.iter().product()];
     check_cuda(
         unsafe {
-            cuvs_sys::cudaMemcpyAsync(
+            cudaMemcpyAsync(
                 values.as_mut_ptr() as *mut _,
                 tensor.dl_tensor.data,
                 tensor_num_bytes(tensor),
-                cuvs_sys::cudaMemcpyKind_cudaMemcpyDefault,
+                CUDA_MEMCPY_DEFAULT,
                 resources
-                    .get_cuda_stream()
+                    .stream()
                     .map_err(|e| Error::io(e.to_string()))?,
             )
         },
