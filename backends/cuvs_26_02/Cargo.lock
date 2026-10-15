@@ -1464,7 +1464,7 @@ dependencies = [
 
 [[package]]
 name = "cuvs"
-version = "26.8.1"
+version = "26.10.0"
 dependencies = [
  "bon",
  "cuvs-sys",
@@ -1474,9 +1474,9 @@ dependencies = [
 
 [[package]]
 name = "cuvs-sys"
-version = "26.8.1"
+version = "26.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "958a7bf301e0638029ef1359370bf5465c9844e215c0ea2fa37d128a5e16ca00"
+checksum = "06939b7e536443e02c18bfc2695a84e3aeb4746af47ca41b558c2392b3100020"
 dependencies = [
  "anyhow",
  "cmake-package",
