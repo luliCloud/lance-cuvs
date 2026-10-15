@@ -25,8 +25,8 @@ arrow-buffer = "58.0.0"
 env_logger = "0.11"
 arrow-schema = "58.0.0"
 arrow-pyarrow = { version = "58.0.0", optional = true }
-cuvs = { path = "../../../vendor/cuvs-26.8.1" }  # local copy: Resources::handle() made pub
-cuvs-sys = "=26.8.1"
+cuvs = { path = "../../../vendor/cuvs-26.10.0" }  # local copy: Resources::handle() made pub
+cuvs-sys = "=26.10.0"
 futures = "0.3"
 half = { version = "2.5", default-features = false, features = ["num-traits", "std"] }
 libc = "0.2"
