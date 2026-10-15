@@ -20,7 +20,7 @@ build-backend = "hatchling.build"
 [dependency-groups]
 dev = [
     "cmake>=3.30.4; sys_platform == 'linux'",
-    "libcuvs-cu12==26.2.0; sys_platform == 'linux'",
+    "libcuvs-cu12==26.8.1; sys_platform == 'linux'",
     "maturin>=1.4,<2; sys_platform == 'linux'",
     "pylance",
     "pytest>=8",

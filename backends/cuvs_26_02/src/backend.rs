@@ -583,7 +583,7 @@ impl TransformSlot {
         check_cuvs(
             unsafe {
                 cuvs_sys::cuvsIvfPqTransform(
-                    trained.resources.0,
+                    trained.resources.handle(),
                     trained.index.raw,
                     self.input_device.as_mut_ptr(),
                     self.labels_device.as_mut_ptr(),
@@ -1366,7 +1366,7 @@ async fn append_transformed_batches_to_artifact(
     let code_width = trained.pq_code_width();
     let cuda_stream = trained
         .resources
-        .get_cuda_stream()
+        .stream()
         .map_err(|error| Error::io(error.to_string()))?;
     let overlap = transform_overlap_enabled_from_env();
     let overlap = if overlap && !can_block_in_place() {
@@ -1853,7 +1853,7 @@ pub async fn train_ivf_pq(
     let build_start = Instant::now();
     let build_result = check_cuvs(
         unsafe {
-            cuvs_sys::cuvsIvfPqBuild(resources.0, params, dataset_tensor.as_mut_ptr(), index.raw)
+            cuvs_sys::cuvsIvfPqBuild(resources.handle(), params, dataset_tensor.as_mut_ptr(), index.raw)
         },
         "build IVF_PQ index",
     );
