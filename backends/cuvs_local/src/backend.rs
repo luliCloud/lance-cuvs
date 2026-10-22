@@ -5,7 +5,8 @@ use crate::cuda::{
     CudaEvent, CudaStream, CuvsIvfPqIndex, DeviceTensor, HostTensorView, MatrixBuffer, PinnedHostBuffer,
     RegisteredHostBuffer, RegistrationCache, Resources, check_cuvs, copy_tensor_to_host_f32_2d, copy_tensor_to_host_f32_3d,
     create_index_params, destroy_index_params, enable_rmm_pool_from_env, ivf_centroids_from_host,
-    jemalloc_never_releases_memory, make_tensor_view, matrix_from_vectors, pq_codebook_from_host,
+    jemalloc_never_releases_memory, make_tensor_view, matrix_from_vectors, pq_codebook_from_host, resolve_cuvs_metric,
+    cosine_normalize_requested, device_row_normalize,
 };
 use arrow::compute::filter;
 use arrow_array::cast::AsArray;
@@ -67,6 +68,8 @@ pub struct TrainedIvfPqIndex {
     pub(crate) metric_type: DistanceType,
     pub(crate) ivf_centroids: FixedSizeListArray,
     pub(crate) pq_codebook: FixedSizeListArray,
+    /// Method B: vectors are L2-normalised by lance-cuvs before cuVS (which then runs L2).
+    pub(crate) normalize_input: bool,
 }
 
 impl TrainedIvfPqIndex {
@@ -578,6 +581,9 @@ impl TransformSlot {
         // No-op ordering-wise when the H2D was enqueued on this same stream.
         self.h2d_done.make_stream_wait(stream)?;
         self.transform_start.record(stream)?;
+        if trained.normalize_input {
+            device_row_normalize(self.input_device.as_mut_ptr_data(), rows, trained.dimension, stream)?;
+        }
         let transform_call_start = Instant::now();
         check_cuvs(
             unsafe {
@@ -1839,19 +1845,27 @@ pub async fn train_ivf_pq(
         ));
     }
 
-    let matrix = matrix_from_vectors(&train_vectors)?;
+    let mut matrix = matrix_from_vectors(&train_vectors)?;
     enable_rmm_pool_from_env()?;
     let resources = Resources::new().map_err(|error| Error::io(error.to_string()))?;
     let index = CuvsIvfPqIndex::try_new()?;
+    let normalize_input = cosine_normalize_requested(metric_type);
+    if normalize_input {
+        let t = Instant::now();
+        // SAFETY: `train_vectors` is the private sample built above; nothing else reads it.
+        unsafe { matrix.normalize_rows_in_place()? };
+        eprintln!("cuVS train sample in-place normalisation: {:.3}s rows={}", t.elapsed().as_secs_f64(), train_vectors.len());
+    }
+    let matrix_view = matrix.view()?;
+    let cuvs_metric = resolve_cuvs_metric(metric_type, &matrix_view);
     let params = create_index_params(
-        metric_type,
+        cuvs_metric,
         num_partitions,
         num_sub_vectors,
         sample_rate,
         max_iters,
         num_bits,
     )?;
-    let matrix_view = matrix.view()?;
     let mut dataset_tensor = HostTensorView::try_new::<f32>(
         &[matrix_view.nrows(), matrix_view.ncols()],
         matrix_view.as_ptr() as *mut std::ffi::c_void,
@@ -1910,6 +1924,7 @@ pub async fn train_ivf_pq(
         metric_type,
         ivf_centroids,
         pq_codebook,
+        normalize_input,
     })
 }
 

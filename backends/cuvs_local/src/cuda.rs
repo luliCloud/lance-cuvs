@@ -290,6 +290,10 @@ impl<T: DlElement> DeviceTensor<T> {
         &mut self.tensor
     }
 
+    pub(crate) fn as_mut_ptr_data(&mut self) -> *mut c_void {
+        self.tensor.dl_tensor.data
+    }
+
     pub(crate) fn set_shape(&mut self, shape: &[usize]) -> Result<()> {
         if shape.len() != self.shape.len() {
             return Err(Error::io(format!(
@@ -959,6 +963,154 @@ pub(crate) fn enable_rmm_pool_from_env() -> Result<()> {
         unsafe { cuvs_sys::cuvsRMMPoolMemoryResourceEnable(initial, max, false) },
         "enable RMM pool memory resource",
     )
+}
+
+/// Largest `| ||row|| - 1 |` over up to `max_rows` evenly spaced rows of `view`.
+pub(crate) fn max_unit_norm_deviation(view: &ArrayView2<'_, f32>, max_rows: usize) -> f32 {
+    let rows = view.nrows();
+    if rows == 0 {
+        return f32::INFINITY;
+    }
+    let step = (rows / max_rows.max(1)).max(1);
+    let mut worst = 0.0f32;
+    for row in view.outer_iter().step_by(step) {
+        let norm = row.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let dev = (norm - 1.0).abs();
+        // NaN norms compare false, so test them explicitly.
+        if !(dev <= worst) {
+            worst = dev;
+        }
+    }
+    worst
+}
+
+/// Choose the metric handed to cuVS for training/transform (`LANCE_CUVS_COSINE_AS_L2`).
+///
+/// cuVS' cosine mode L2-normalises the IVF centroids, which makes the residuals that PQ
+/// encodes larger (lower recall than Lance's CPU path). For unit-length vectors cosine and
+/// L2 rank identically, so cuVS can be asked for L2: it then keeps the k-means means as
+/// centroids and assigns/encodes with L2. In L2 mode cuVS does not normalise the input, so
+/// this is only valid when the vectors already have unit length.
+///   unset / `off`  : pass cosine (old behaviour)
+///   `auto`         : pass L2 only if the sampled training rows are all unit length
+///   `force` / `1`  : pass L2 unconditionally (caller guarantees unit length)
+pub(crate) fn resolve_cuvs_metric(
+    metric_type: DistanceType,
+    view: &ArrayView2<'_, f32>,
+) -> DistanceType {
+    if metric_type != DistanceType::Cosine {
+        return metric_type;
+    }
+    let mode = std::env::var("LANCE_CUVS_COSINE_AS_L2")
+        .ok()
+        .or_else(|| {
+            (std::env::var("LANCE_CUVS_EXPERIMENT_COSINE_AS_L2").as_deref() == Ok("1"))
+                .then(|| "force".to_string())
+        })
+        .unwrap_or_else(|| "off".to_string());
+    match mode.as_str() {
+        "normalize" => {
+            eprintln!("cuVS metric: cosine requested, normalising vectors ourselves and passing L2 (LANCE_CUVS_COSINE_AS_L2=normalize)");
+            DistanceType::L2
+        }
+        "force" | "1" => {
+            eprintln!("cuVS metric: cosine requested, passing L2 (LANCE_CUVS_COSINE_AS_L2=force)");
+            DistanceType::L2
+        }
+        "auto" => {
+            const TOL: f32 = 1e-3;
+            let dev = max_unit_norm_deviation(view, 100_000);
+            if dev <= TOL {
+                eprintln!(
+                    "cuVS metric: cosine requested, training sample is unit length (max |norm-1| = {dev:.2e}), passing L2"
+                );
+                DistanceType::L2
+            } else {
+                eprintln!(
+                    "cuVS metric: cosine requested, training sample is not unit length (max |norm-1| = {dev:.2e}), keeping cosine"
+                );
+                DistanceType::Cosine
+            }
+        }
+        _ => DistanceType::Cosine,
+    }
+}
+
+/// True when `LANCE_CUVS_COSINE_AS_L2=normalize` and the requested metric is cosine: lance-cuvs
+/// then L2-normalises every vector (training sample on the host, transform batches on the GPU)
+/// and asks cuVS for plain L2, like Lance's CPU path (works for non-unit-length data).
+pub(crate) fn cosine_normalize_requested(metric_type: DistanceType) -> bool {
+    metric_type == DistanceType::Cosine
+        && std::env::var("LANCE_CUVS_COSINE_AS_L2").as_deref() == Ok("normalize")
+}
+
+/// In-place row-wise L2 normalisation of a row-major f32 buffer (zero / non-finite rows are
+/// left unchanged), multi-threaded.
+fn normalize_rows_in_place(data: &mut [f32], cols: usize) {
+    if cols == 0 || data.is_empty() {
+        return;
+    }
+    let rows = data.len() / cols;
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).min(64);
+    let chunk = rows.div_ceil(threads).max(1);
+    std::thread::scope(|scope| {
+        for part in data.chunks_mut(chunk * cols) {
+            scope.spawn(move || {
+                for row in part.chunks_mut(cols) {
+                    let n2 = row.iter().map(|v| v * v).sum::<f32>();
+                    let inv = if n2 > 0.0 && n2.is_finite() { 1.0 / n2.sqrt() } else { 1.0 };
+                    for v in row {
+                        *v *= inv;
+                    }
+                }
+            });
+        }
+    });
+}
+
+impl MatrixBuffer<'_> {
+    /// L2-normalises every row in place, without making a copy.
+    ///
+    /// # Safety
+    /// The caller must exclusively own the memory behind a `Borrowed` buffer (no other
+    /// reader or writer while this runs, and nothing may rely on the old values later).
+    /// `train_ivf_pq` satisfies this: the sample is a private buffer it built itself.
+    pub(crate) unsafe fn normalize_rows_in_place(&mut self) -> Result<()> {
+        match self {
+            Self::Borrowed { values, rows, cols } => {
+                let data = unsafe {
+                    std::slice::from_raw_parts_mut(values.as_ptr() as *mut f32, *rows * *cols)
+                };
+                normalize_rows_in_place(data, *cols);
+            }
+            Self::Owned(array) => {
+                let cols = array.ncols();
+                let data = array
+                    .as_slice_mut()
+                    .ok_or_else(|| Error::io("training matrix is not contiguous"))?;
+                normalize_rows_in_place(data, cols);
+            }
+        }
+        Ok(())
+    }
+}
+
+unsafe extern "C" {
+    fn lance_cuvs_row_normalize_f32(data: *mut f32, rows: i64, dim: i64, stream: *mut c_void) -> c_int;
+}
+
+/// In-place row-wise L2 normalisation of a device f32 matrix on `stream`.
+pub(crate) fn device_row_normalize(
+    data: *mut c_void,
+    rows: usize,
+    dim: usize,
+    stream: cuvs_sys::cudaStream_t,
+) -> Result<()> {
+    let rc = unsafe { lance_cuvs_row_normalize_f32(data as *mut f32, rows as i64, dim as i64, stream as *mut c_void) };
+    if rc != 0 {
+        return Err(Error::io(format!("row normalise kernel failed (cuda error {rc})")));
+    }
+    Ok(())
 }
 
 pub(crate) fn cuvs_distance_type(metric_type: DistanceType) -> Result<cuvs_sys::cuvsDistanceType> {
