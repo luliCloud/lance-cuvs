@@ -13,6 +13,7 @@
 
 mod backend;
 mod cuda;
+mod page_pool;
 #[cfg(feature = "python")]
 mod python;
 

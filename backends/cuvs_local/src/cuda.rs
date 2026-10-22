@@ -767,6 +767,9 @@ pub(crate) struct PinnedHostBuffer<T> {
     _marker: PhantomData<T>,
 }
 
+// SAFETY: the buffer owns its pinned allocation exclusively (same as the cuvs_26_02 backend).
+unsafe impl<T: Send> Send for PinnedHostBuffer<T> {}
+
 impl<T: Copy> PinnedHostBuffer<T> {
     pub(crate) fn try_new(len: usize) -> Result<Self> {
         let bytes = len

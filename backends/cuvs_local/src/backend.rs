@@ -1415,6 +1415,8 @@ async fn append_transformed_batches_to_artifact(
             prepare_workers
         );
     }
+    // EXPERIMENT H2: pinned pool for lance-io's O_DIRECT page buffers (guard unregisters on drop).
+    let _page_pool_guard = crate::page_pool::page_pool_from_env()?;
     let registration_cache = if !registration_cache_enabled_from_env() {
         None
     } else {
