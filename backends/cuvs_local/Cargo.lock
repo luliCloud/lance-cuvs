@@ -5517,6 +5517,7 @@ dependencies = [
  "lance",
  "lance-arrow",
  "lance-core",
+ "lance-encoding",
  "lance-file",
  "lance-index",
  "lance-io",
